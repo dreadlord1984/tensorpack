@@ -4,10 +4,13 @@
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 import time
+import tqdm
+
 from collections import deque
-from .base import DataFlow
-from ..utils import logger, get_tqdm
-from ..utils.serialize import dumps, loads, dumps_for_tfop
+from .base import DataFlow, DataFlowReentrantGuard
+from ..utils import logger
+from ..utils.utils import get_tqdm_kwargs
+from ..utils.serialize import dumps, loads
 try:
     import zmq
 except ImportError:
@@ -17,19 +20,28 @@ else:
     __all__ = ['send_dataflow_zmq', 'RemoteDataZMQ']
 
 
-def send_dataflow_zmq(df, addr, hwm=50, print_interval=100, format=None):
+def send_dataflow_zmq(df, addr, hwm=50, format=None):
     """
     Run DataFlow and send data to a ZMQ socket addr.
-    It will dump and send each datapoint to this addr with a PUSH socket.
+    It will __connect__ to this addr,
+    serialize and send each datapoint to this addr with a PUSH socket.
+    This function never returns unless an error is encountered.
 
     Args:
         df (DataFlow): Will infinitely loop over the DataFlow.
-        addr: a ZMQ socket addr.
-        hwm (int): high water mark
+        addr: a ZMQ socket endpoint.
+        hwm (int): ZMQ high-water mark (buffer size)
+        format (str): The serialization format.
+             Default format would use :mod:`tensorpack.utils.serialize` (i.e. msgpack).
+             An alternate format is 'zmq_op'.
     """
-    # format (str): The serialization format. ZMQ Op is still not publicly usable now
-    #     Default format would use :mod:`tensorpack.utils.serialize`.
-    dump_fn = dumps if format is None else dumps_for_tfop
+    assert format in [None, 'zmq_op']
+    if format is None:
+        dump_fn = dumps
+    else:
+        from ..user_ops.zmq_recv import dumps_zmq_op
+        dump_fn = dumps_zmq_op
+
     ctx = zmq.Context()
     socket = ctx.socket(zmq.PUSH)
     socket.set_hwm(hwm)
@@ -37,16 +49,25 @@ def send_dataflow_zmq(df, addr, hwm=50, print_interval=100, format=None):
     try:
         df.reset_state()
         logger.info("Serving data to {} ...".format(addr))
-        q = deque(maxlen=print_interval)
-        with get_tqdm(total=0) as pbar:
-            while True:
+        INTERVAL = 200
+        q = deque(maxlen=INTERVAL)
+
+        try:
+            total = df.size()
+        except NotImplementedError:
+            total = 0
+        tqdm_args = get_tqdm_kwargs(leave=True)
+        tqdm_args['bar_format'] = tqdm_args['bar_format'] + "{postfix}"
+        while True:
+            with tqdm.trange(total, **tqdm_args) as pbar:
                 for dp in df.get_data():
                     start = time.time()
                     socket.send(dump_fn(dp), copy=False)
                     q.append(time.time() - start)
                     pbar.update(1)
-                    if pbar.n % print_interval == 0:
-                        pbar.write("Avg send time @{}: {}".format(pbar.n, sum(q) / len(q)))
+                    if pbar.n % INTERVAL == 0:
+                        avg = "{:.3f}".format(sum(q) / len(q))
+                        pbar.set_postfix({'AvgSendLat': avg})
     finally:
         socket.setsockopt(zmq.LINGER, 0)
         socket.close()
@@ -57,61 +78,66 @@ def send_dataflow_zmq(df, addr, hwm=50, print_interval=100, format=None):
 class RemoteDataZMQ(DataFlow):
     """
     Produce data from ZMQ PULL socket(s).
+    See http://tensorpack.readthedocs.io/en/latest/tutorial/efficient-dataflow.html#distributed-dataflow
 
     Attributes:
         cnt1, cnt2 (int): number of data points received from addr1 and addr2
     """
-    def __init__(self, addr1, addr2=None):
+    def __init__(self, addr1, addr2=None, hwm=50):
         """
         Args:
             addr1,addr2 (str): addr of the socket to connect to.
                 Use both if you need two protocols (e.g. both IPC and TCP).
                 I don't think you'll ever need 3.
+            hwm (int): ZMQ high-water mark (buffer size)
         """
         assert addr1
         self._addr1 = addr1
         self._addr2 = addr2
+        self._hwm = int(hwm)
+        self._guard = DataFlowReentrantGuard()
 
     def reset_state(self):
         self.cnt1 = 0
         self.cnt2 = 0
 
     def get_data(self):
-        try:
-            ctx = zmq.Context()
-            if self._addr2 is None:
-                socket = ctx.socket(zmq.PULL)
-                socket.set_hwm(50)
-                socket.bind(self._addr1)
+        with self._guard:
+            try:
+                ctx = zmq.Context()
+                if self._addr2 is None:
+                    socket = ctx.socket(zmq.PULL)
+                    socket.set_hwm(self._hwm)
+                    socket.bind(self._addr1)
 
-                while True:
-                    dp = loads(socket.recv(copy=False).bytes)
-                    yield dp
-                    self.cnt1 += 1
-            else:
-                socket1 = ctx.socket(zmq.PULL)
-                socket1.set_hwm(50)
-                socket1.bind(self._addr1)
-
-                socket2 = ctx.socket(zmq.PULL)
-                socket2.set_hwm(50)
-                socket2.bind(self._addr2)
-
-                poller = zmq.Poller()
-                poller.register(socket1, zmq.POLLIN)
-                poller.register(socket2, zmq.POLLIN)
-
-                while True:
-                    evts = poller.poll()
-                    for sock, evt in evts:
-                        dp = loads(sock.recv(copy=False).bytes)
+                    while True:
+                        dp = loads(socket.recv(copy=False).bytes)
                         yield dp
-                        if sock == socket1:
-                            self.cnt1 += 1
-                        else:
-                            self.cnt2 += 1
-        finally:
-            ctx.destroy(linger=0)
+                        self.cnt1 += 1
+                else:
+                    socket1 = ctx.socket(zmq.PULL)
+                    socket1.set_hwm(self._hwm)
+                    socket1.bind(self._addr1)
+
+                    socket2 = ctx.socket(zmq.PULL)
+                    socket2.set_hwm(self._hwm)
+                    socket2.bind(self._addr2)
+
+                    poller = zmq.Poller()
+                    poller.register(socket1, zmq.POLLIN)
+                    poller.register(socket2, zmq.POLLIN)
+
+                    while True:
+                        evts = poller.poll()
+                        for sock, evt in evts:
+                            dp = loads(sock.recv(copy=False).bytes)
+                            yield dp
+                            if sock == socket1:
+                                self.cnt1 += 1
+                            else:
+                                self.cnt2 += 1
+            finally:
+                ctx.destroy(linger=0)
 
 
 if __name__ == '__main__':

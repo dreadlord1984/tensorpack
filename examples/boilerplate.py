@@ -4,8 +4,9 @@
 
 import os
 import argparse
-from tensorpack import *
 import tensorflow as tf
+
+from tensorpack import *
 
 """
 This is a boiler-plate template.
@@ -30,7 +31,7 @@ class Model(ModelDesc):
         summary.add_moving_summary(self.cost)
 
     def _get_optimizer(self):
-        lr = symbolic_functions.get_scalar_var('learning_rate', 5e-3, summary=True)
+        lr = tf.get_variable('learning_rate', initializer=5e-3, trainable=False)
         return tf.train.AdamOptimizer(lr)
 
 
@@ -51,7 +52,7 @@ def get_config():
 
     return TrainConfig(
         model=Model(),
-        dataflow=ds_train,
+        data=QueueInput(ds_train),
         callbacks=[
             ModelSaver(),
             InferenceRunner(ds_test, [ScalarStats('total_costs')]),
@@ -71,9 +72,10 @@ if __name__ == '__main__':
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     config = get_config()
-    config.nr_tower = get_nr_gpu()
 
+    if args.gpu:
+        config.nr_tower = len(args.gpu.split(','))
     if args.load:
         config.session_init = SaverRestore(args.load)
 
-    SyncMultiGPUTrainer(config).train()
+    launch_train_with_config(config, SimpleTrainer())

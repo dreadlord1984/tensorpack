@@ -5,44 +5,56 @@
 import tensorflow as tf
 import six
 
-from ..models import ModelDesc
-from ..utils.develop import log_deprecated
+from ..graph_builder import ModelDescBase
 from ..tfutils import get_default_sess_config
+from ..tfutils.tower import TowerFuncWrapper
 from ..tfutils.sessinit import SessionInit, JustCurrentSession
-from ..tfutils.sesscreate import NewSessionCreator
 
 __all__ = ['PredictConfig']
 
 
 class PredictConfig(object):
-    def __init__(self, model,
+    def __init__(self,
+                 model=None,
+                 inputs_desc=None,
+                 tower_func=None,
                  session_creator=None,
                  session_init=None,
                  input_names=None,
                  output_names=None,
                  return_input=False,
                  create_graph=True,
-                 session_config=None,   # deprecated
                  ):
         """
         Args:
-            model (ModelDesc): the model to use.
+            model (ModelDescBase): to be used to obtain inputs_desc and tower_func.
+            inputs_desc ([InputDesc]):
+            tower_func: a callable which takes input tensors
+
             session_creator (tf.train.SessionCreator): how to create the
-                session. Defaults to :class:`sesscreate.NewSessionCreator()`.
+                session. Defaults to :class:`tf.train.ChiefSessionCreator()`.
             session_init (SessionInit): how to initialize variables of the session.
                 Defaults to do nothing.
-            input_names (list): a list of input tensor names. Defaults to all
-                inputs of the model.
+            input_names (list): a list of input tensor names. Defaults to match inputs_desc.
             output_names (list): a list of names of the output tensors to predict, the
                 tensors can be any computable tensor in the graph.
             return_input (bool): same as in :attr:`PredictorBase.return_input`.
             create_graph (bool): create a new graph, or use the default graph
                 when then predictor is first initialized.
+
+        You need to set either `model`, or `inputs_desc` plus `tower_func`.
         """
         def assert_type(v, tp):
             assert isinstance(v, tp), v.__class__
-        self.model = model
-        assert_type(self.model, ModelDesc)
+        if model is not None:
+            assert_type(model, ModelDescBase)
+            assert inputs_desc is None and tower_func is None
+            self.inputs_desc = model.get_inputs_desc()
+            self.tower_func = TowerFuncWrapper(model.build_graph, self.inputs_desc)
+        else:
+            assert inputs_desc is not None and tower_func is not None
+            self.inputs_desc = inputs_desc
+            self.tower_func = TowerFuncWrapper(tower_func, inputs_desc)
 
         if session_init is None:
             session_init = JustCurrentSession()
@@ -50,20 +62,14 @@ class PredictConfig(object):
         assert_type(self.session_init, SessionInit)
 
         if session_creator is None:
-            if session_config is not None:
-                log_deprecated("PredictConfig(session_config=)", "Use session_creator instead!", "2017-04-20")
-                self.session_creator = NewSessionCreator(config=session_config)
-            else:
-                self.session_creator = NewSessionCreator(config=get_default_sess_config(0.4))
+            self.session_creator = tf.train.ChiefSessionCreator(config=get_default_sess_config())
         else:
             self.session_creator = session_creator
 
         # inputs & outputs
         self.input_names = input_names
         if self.input_names is None:
-            # neither options is set, assume all inputs
-            raw_tensors = self.model.get_inputs_desc()
-            self.input_names = [k.name for k in raw_tensors]
+            self.input_names = [k.name for k in self.inputs_desc]
         self.output_names = output_names
         assert_type(self.output_names, list)
         assert_type(self.input_names, list)

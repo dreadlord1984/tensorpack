@@ -3,13 +3,14 @@
 # File: cifar10-resnet.py
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
-import numpy as np
 import argparse
 import os
 
+
 from tensorpack import *
-from tensorpack.tfutils.symbolic_functions import *
-from tensorpack.tfutils.summary import *
+from tensorpack.tfutils.summary import add_moving_summary, add_param_summary
+from tensorpack.utils.gpu import get_nr_gpu
+from tensorpack.dataflow import dataset
 
 import tensorflow as tf
 from tensorflow.contrib.layers import variance_scaling_initializer
@@ -61,7 +62,7 @@ class Model(ModelDesc):
                 out_channel = in_channel
                 stride1 = 1
 
-            with tf.variable_scope(name) as scope:
+            with tf.variable_scope(name):
                 b1 = l if first else BNReLU(l)
                 c1 = Conv2D('conv1', b1, out_channel, stride=stride1, nl=BNReLU)
                 c2 = Conv2D('conv2', c1, out_channel)
@@ -94,12 +95,12 @@ class Model(ModelDesc):
             l = GlobalAvgPooling('gap', l)
 
         logits = FullyConnected('linear', l, out_dim=10, nl=tf.identity)
-        prob = tf.nn.softmax(logits, name='output')
+        tf.nn.softmax(logits, name='output')
 
         cost = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
         cost = tf.reduce_mean(cost, name='cross_entropy_loss')
 
-        wrong = prediction_incorrect(logits, label)
+        wrong = tf.to_float(tf.logical_not(tf.nn.in_top_k(logits, label, 1)), name='wrong_vector')
         # monitor training error
         add_moving_summary(tf.reduce_mean(wrong, name='train_error'))
 
@@ -113,7 +114,7 @@ class Model(ModelDesc):
         self.cost = tf.add_n([cost, wd_cost], name='cost')
 
     def _get_optimizer(self):
-        lr = get_scalar_var('learning_rate', 0.01, summary=True)
+        lr = tf.get_variable('learning_rate', initializer=0.01, trainable=False)
         opt = tf.train.MomentumOptimizer(lr, 0.9)
         return opt
 
@@ -140,25 +141,6 @@ def get_data(train_or_test):
     return ds
 
 
-def get_config():
-    logger.auto_set_dir()
-    dataset_train = get_data('train')
-    dataset_test = get_data('test')
-
-    return TrainConfig(
-        dataflow=dataset_train,
-        callbacks=[
-            ModelSaver(),
-            InferenceRunner(dataset_test,
-                            [ScalarStats('cost'), ClassificationError()]),
-            ScheduledHyperParamSetter('learning_rate',
-                                      [(1, 0.1), (82, 0.01), (123, 0.001), (300, 0.0002)])
-        ],
-        model=Model(n=NUM_UNITS),
-        max_epoch=400,
-    )
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
@@ -172,8 +154,23 @@ if __name__ == '__main__':
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
-    config = get_config()
-    if args.load:
-        config.session_init = SaverRestore(args.load)
-    config.nr_tower = max(get_nr_gpu(), 1)
-    SyncMultiGPUTrainer(config).train()
+    logger.auto_set_dir()
+
+    dataset_train = get_data('train')
+    dataset_test = get_data('test')
+
+    config = TrainConfig(
+        model=Model(n=NUM_UNITS),
+        dataflow=dataset_train,
+        callbacks=[
+            ModelSaver(),
+            InferenceRunner(dataset_test,
+                            [ScalarStats('cost'), ClassificationError('wrong_vector')]),
+            ScheduledHyperParamSetter('learning_rate',
+                                      [(1, 0.1), (82, 0.01), (123, 0.001), (300, 0.0002)])
+        ],
+        max_epoch=400,
+        session_init=SaverRestore(args.load) if args.load else None
+    )
+    nr_gpu = max(get_nr_gpu(), 1)
+    launch_train_with_config(config, SyncMultiGPUTrainerParameterServer(nr_gpu))

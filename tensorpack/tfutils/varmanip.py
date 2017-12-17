@@ -5,15 +5,15 @@
 
 import six
 import os
+import pprint
 import tensorflow as tf
-from collections import defaultdict
 import numpy as np
 from ..utils import logger
-from ..utils.naming import PREDICT_TOWER
 from .common import get_op_tensor_name
 
 __all__ = ['SessionUpdate', 'dump_session_params', 'dump_chkpt_vars',
-           'get_savename_from_varname', 'is_training_name',
+           'load_chkpt_vars',
+           # 'get_savename_from_varname', 'is_training_name',
            'get_checkpoint_path']
 
 
@@ -29,10 +29,6 @@ def get_savename_from_varname(
         str: the name used to save the variable
     """
     name = varname
-    if PREDICT_TOWER in name:
-        logger.error("No variable under '{}' name scope should be saved!".format(PREDICT_TOWER))
-        # don't overwrite anything in the current prediction graph
-        return None
     if varname_prefix is not None \
             and name.startswith(varname_prefix):
         name = name[len(varname_prefix) + 1:]
@@ -51,9 +47,7 @@ class SessionUpdate(object):
             vars_to_update: a collection of variables to update
         """
         self.sess = sess
-        self.name_map = defaultdict(list)
-        for v in vars_to_update:
-            self.name_map[v.name].append(v)
+        self.name_map = {v.name: v for v in vars_to_update}
 
     @staticmethod
     def load_value_to_var(var, val, strict=False):
@@ -79,7 +73,7 @@ class SessionUpdate(object):
                 name, val.shape, varshape))
             val = val.reshape(varshape)
 
-        # fix some common type incompatibility problem, but is certainly not enough
+        # fix some common type incompatibility problems, but not all
         def upcast(vartype, valtype):
             # allow up-casting
             if vartype == tf.float64 and valtype == np.float32:
@@ -112,28 +106,36 @@ class SessionUpdate(object):
         with self.sess.as_default():
             for name, value in six.iteritems(prms):
                 assert name in self.name_map
-                for v in self.name_map[name]:
-                    SessionUpdate.load_value_to_var(v, value)
+                v = self.name_map[name]
+                SessionUpdate.load_value_to_var(v, value)
 
 
 def dump_session_params(path):
     """
     Dump value of all TRAINABLE + MODEL variables to a dict, and save as
-    npy format (loadable by :class:`DictRestore`).
+    npy/npz format (loadable by :class:`DictRestore`).
 
     Args:
-        path(str): the path to save the parameters.
+        path(str): the file name to save the parameters. Must ends with npy or npz.
     """
     var = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
     var.extend(tf.get_collection(tf.GraphKeys.MODEL_VARIABLES))
     # TODO dedup
     assert len(set(var)) == len(var), "TRAINABLE and MODEL variables have duplication!"
+    gvars = set([k.name for k in tf.global_variables()])
+    var = [v for v in var if v.name in gvars]
     result = {}
     for v in var:
         result[v.name] = v.eval()
     logger.info("Variables to save to {}:".format(path))
-    logger.info(str(result.keys()))
-    np.save(path, result)
+    keys = sorted(list(result.keys()))
+    logger.info(pprint.pformat(keys))
+    if path.endswith('.npy'):
+        np.save(path, result)
+    elif path.endswith('.npz'):
+        np.savez_compressed(path, **result)
+    else:
+        raise ValueError("Don't know which format to use for {}".format(path))
 
 
 def get_checkpoint_path(model_path):
@@ -148,7 +150,7 @@ def get_checkpoint_path(model_path):
     if os.path.basename(model_path) == model_path:
         model_path = os.path.join('.', model_path)  # avoid #4921 and #6142
     if os.path.basename(model_path) == 'checkpoint':
-        assert os.path.isfile(model_path), model_path
+        assert tf.gfile.Exists(model_path), model_path
         model_path = tf.train.latest_checkpoint(os.path.dirname(model_path))
         # to be consistent with either v1 or v2
 
@@ -162,15 +164,18 @@ def get_checkpoint_path(model_path):
         logger.warn(
             "Checkpoint path {} is auto-corrected to {}.".format(model_path, new_path))
         model_path = new_path
-    assert os.path.isfile(model_path) or os.path.isfile(model_path + '.index'), model_path
+    assert tf.gfile.Exists(model_path) or tf.gfile.Exists(model_path + '.index'), model_path
     return model_path
 
 
-def dump_chkpt_vars(model_path):
-    """ Dump all variables from a checkpoint to a dict.
+def load_chkpt_vars(model_path):
+    """ Load all variables from a checkpoint to a dict.
 
     Args:
         model_path(str): path to a checkpoint.
+
+    Returns:
+        dict: a name:value dict
     """
     model_path = get_checkpoint_path(model_path)
     reader = tf.train.NewCheckpointReader(model_path)
@@ -181,13 +186,15 @@ def dump_chkpt_vars(model_path):
     return result
 
 
+def dump_chkpt_vars(model_path):
+    logger.warn("dump_chkpt_vars was renamed to load_chkpt_vars!")
+    return load_chkpt_vars(model_path)
+
+
 def is_training_name(name):
     """
-    Guess if a name belongs to a training-only variables.
+    **Guess** if this variable is only used in training.
     Only used internally to avoid too many logging. Do not use it.
-
-    Returns:
-        bool: Guess whether this tensor is something only used in training.
     """
     # TODO: maybe simply check against TRAINABLE_VARIABLES and MODEL_VARIABLES?
     # TODO or use get_slot_names()
@@ -202,6 +209,6 @@ def is_training_name(name):
         return True
     if name.endswith('/Adagrad'):
         return True
-    if 'EMA_summary/' in name:
+    if name.startswith('EMA/'):  # all the moving average summaries
         return True
     return False

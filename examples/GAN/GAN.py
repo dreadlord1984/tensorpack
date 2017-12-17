@@ -5,14 +5,15 @@
 
 import tensorflow as tf
 import numpy as np
-import time
-from tensorpack import (FeedfreeTrainerBase, QueueInput,
-                        ModelDesc, DataFlow, StagingInputWrapper,
-                        MultiGPUTrainerBase, LeastLoadedDeviceSetter)
+from tensorpack import (TowerTrainer,
+                        ModelDescBase, DataFlow, StagingInput)
+from tensorpack.tfutils.tower import TowerContext, TowerFuncWrapper
+from tensorpack.graph_builder import DataParallelBuilder, LeastLoadedDeviceSetter
 from tensorpack.tfutils.summary import add_moving_summary
+from tensorpack.utils.argtools import memoized
 
 
-class GANModelDesc(ModelDesc):
+class GANModelDesc(ModelDescBase):
     def collect_variables(self, g_scope='gen', d_scope='discrim'):
         """
         Assign self.g_vars to the parameters under scope `g_scope`,
@@ -57,89 +58,117 @@ class GANModelDesc(ModelDesc):
 
             add_moving_summary(self.g_loss, self.d_loss, d_accuracy, g_accuracy)
 
+    @memoized
+    def get_optimizer(self):
+        return self._get_optimizer()
 
-class GANTrainer(FeedfreeTrainerBase):
-    def __init__(self, config):
-        self._input_source = QueueInput(config.dataflow)
-        super(GANTrainer, self).__init__(config)
 
-    def _setup(self):
-        super(GANTrainer, self)._setup()
-        self.build_train_tower()
-        opt = self.model.get_optimizer()
+class GANTrainer(TowerTrainer):
+    def __init__(self, input, model):
+        super(GANTrainer, self).__init__()
+        assert isinstance(model, GANModelDesc), model
+        inputs_desc = model.get_inputs_desc()
+        # Setup input
+        cbs = input.setup(inputs_desc)
+        self.register_callback(cbs)
 
+        """
+        We need to set tower_func because it's a TowerTrainer,
+        and only TowerTrainer supports automatic graph creation for inference during training.
+
+        If we don't care about inference during training, using tower_func is
+        not needed. Just calling model.build_graph directly is OK.
+        """
+        # Build the graph
+        self.tower_func = TowerFuncWrapper(model.build_graph, inputs_desc)
+        with TowerContext('', is_training=True):
+            self.tower_func(*input.get_input_tensors())
+        opt = model.get_optimizer()
+
+        # Define the training iteration
         # by default, run one d_min after one g_min
-        self.g_min = opt.minimize(self.model.g_loss, var_list=self.model.g_vars, name='g_op')
-        with tf.control_dependencies([self.g_min]):
-            self.d_min = opt.minimize(self.model.d_loss, var_list=self.model.d_vars, name='d_op')
-        self.train_op = self.d_min
+        with tf.name_scope('optimize'):
+            g_min = opt.minimize(model.g_loss, var_list=model.g_vars, name='g_op')
+            with tf.control_dependencies([g_min]):
+                d_min = opt.minimize(model.d_loss, var_list=model.d_vars, name='d_op')
+        self.train_op = d_min
 
 
-class SeparateGANTrainer(FeedfreeTrainerBase):
-    """ A GAN trainer which runs two optimization ops with a certain ratio, one in each step. """
-    def __init__(self, config, d_period=1, g_period=1):
+class SeparateGANTrainer(TowerTrainer):
+    """ A GAN trainer which runs two optimization ops with a certain ratio."""
+    def __init__(self, input, model, d_period=1, g_period=1):
         """
         Args:
             d_period(int): period of each d_opt run
             g_period(int): period of each g_opt run
         """
-        self._input_source = QueueInput(config.dataflow)
+        super(SeparateGANTrainer, self).__init__()
         self._d_period = int(d_period)
         self._g_period = int(g_period)
         assert min(d_period, g_period) == 1
-        super(SeparateGANTrainer, self).__init__(config)
 
-    def _setup(self):
-        super(SeparateGANTrainer, self)._setup()
-        self.build_train_tower()
+        # Setup input
+        cbs = input.setup(model.get_inputs_desc())
+        self.register_callback(cbs)
 
-        opt = self.model.get_optimizer()
-        self.d_min = opt.minimize(
-            self.model.d_loss, var_list=self.model.d_vars, name='d_min')
-        self.g_min = opt.minimize(
-            self.model.g_loss, var_list=self.model.g_vars, name='g_min')
-        self._cnt = 1
+        # Build the graph
+        self.tower_func = TowerFuncWrapper(model.build_graph, model.get_inputs_desc())
+        with TowerContext('', is_training=True):
+            self.tower_func(*input.get_input_tensors())
+
+        opt = model.get_optimizer()
+        with tf.name_scope('optimize'):
+            self.d_min = opt.minimize(
+                model.d_loss, var_list=model.d_vars, name='d_min')
+            self.g_min = opt.minimize(
+                model.g_loss, var_list=model.g_vars, name='g_min')
 
     def run_step(self):
-        if self._cnt % (self._d_period) == 0:
+        # Define the training iteration
+        if self.global_step % (self._d_period) == 0:
             self.hooked_sess.run(self.d_min)
-        if self._cnt % (self._g_period) == 0:
+        if self.global_step % (self._g_period) == 0:
             self.hooked_sess.run(self.g_min)
-        self._cnt += 1
 
 
-class MultiGPUGANTrainer(MultiGPUTrainerBase, FeedfreeTrainerBase):
+class MultiGPUGANTrainer(TowerTrainer):
     """
     A replacement of GANTrainer (optimize d and g one by one) with multi-gpu support.
     """
-    def __init__(self, config):
-        super(MultiGPUGANTrainer, self).__init__(config)
-        self._nr_gpu = config.nr_tower
-        assert self._nr_gpu > 1
-        self._raw_devices = ['/gpu:{}'.format(k) for k in self.config.tower]
-        self._input_source = StagingInputWrapper(QueueInput(config.dataflow), self._raw_devices)
+    def __init__(self, nr_gpu, input, model):
+        super(MultiGPUGANTrainer, self).__init__()
+        assert nr_gpu > 1
+        raw_devices = ['/gpu:{}'.format(k) for k in range(nr_gpu)]
 
-    def _setup(self):
-        super(MultiGPUGANTrainer, self)._setup()
-        devices = [LeastLoadedDeviceSetter(d, self._raw_devices) for d in self._raw_devices]
+        # Setup input
+        input = StagingInput(input, list(range(nr_gpu)))
+        cbs = input.setup(model.get_inputs_desc())
+        self.register_callback(cbs)
 
-        def get_cost():
-            self.build_train_tower()
-            return [self.model.d_loss, self.model.g_loss]
-        cost_list = MultiGPUTrainerBase.build_on_multi_tower(
-            self.config.tower, get_cost, devices)
-        # simply average the cost. might be faster to average the gradients
-        d_loss = tf.add_n([x[0] for x in cost_list]) * (1.0 / self._nr_gpu)
-        g_loss = tf.add_n([x[1] for x in cost_list]) * (1.0 / self._nr_gpu)
+        # Build the graph with multi-gpu replication
+        def get_cost(*inputs):
+            model.build_graph(*inputs)
+            return [model.d_loss, model.g_loss]
+        self.tower_func = TowerFuncWrapper(get_cost, model.get_inputs_desc())
+        devices = [LeastLoadedDeviceSetter(d, raw_devices) for d in raw_devices]
+        cost_list = DataParallelBuilder.build_on_towers(
+            list(range(nr_gpu)),
+            lambda: self.tower_func(*input.get_input_tensors()),
+            devices)
+        # Simply average the cost here. It might be faster to average the gradients
+        with tf.name_scope('optimize'):
+            d_loss = tf.add_n([x[0] for x in cost_list]) * (1.0 / nr_gpu)
+            g_loss = tf.add_n([x[1] for x in cost_list]) * (1.0 / nr_gpu)
 
-        opt = self.model.get_optimizer()
-        # run one d_min after one g_min
-        self.g_min = opt.minimize(g_loss, var_list=self.model.g_vars,
-                                  colocate_gradients_with_ops=True, name='g_op')
-        with tf.control_dependencies([self.g_min]):
-            self.d_min = opt.minimize(d_loss, var_list=self.model.d_vars,
-                                      colocate_gradients_with_ops=True, name='d_op')
-        self.train_op = self.d_min
+            opt = model.get_optimizer()
+            # run one d_min after one g_min
+            g_min = opt.minimize(g_loss, var_list=model.g_vars,
+                                 colocate_gradients_with_ops=True, name='g_op')
+            with tf.control_dependencies([g_min]):
+                d_min = opt.minimize(d_loss, var_list=model.d_vars,
+                                     colocate_gradients_with_ops=True, name='d_op')
+        # Define the training iteration
+        self.train_op = d_min
 
 
 class RandomZData(DataFlow):

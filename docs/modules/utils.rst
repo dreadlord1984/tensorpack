@@ -51,14 +51,6 @@ tensorpack.utils.logger module
     :show-inheritance:
 
 
-tensorpack.utils.rect module
-----------------------------
-
-.. automodule:: tensorpack.utils.rect
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
 tensorpack.utils.serialize module
 ---------------------------------
 
@@ -91,11 +83,10 @@ tensorpack.utils.viz module
     :undoc-members:
     :show-inheritance:
 
+tensorpack.utils.gpu module
+---------------------------
 
-Module contents
----------------
-
-.. automodule:: tensorpack.utils
+.. automodule:: tensorpack.utils.gpu
     :members:
     :undoc-members:
     :show-inheritance:

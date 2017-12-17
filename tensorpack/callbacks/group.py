@@ -44,8 +44,8 @@ class CallbackTimeLogger(object):
 
 class Callbacks(Callback):
     """
-    A container to hold all callbacks, and execute them in the right order
-    (e.g. :class:`StatPrinter` will be executed at last).
+    A container to hold all callbacks, and trigger them iteratively.
+    Note that it does nothing to before_run/after_run.
     """
 
     def __init__(self, cbs):
@@ -98,7 +98,3 @@ class Callbacks(Callback):
     def _after_epoch(self):
         for cb in self.cbs:
             cb.after_epoch()
-
-    def append(self, cb):
-        assert isinstance(cb, Callback)
-        self.cbs.append(cb)

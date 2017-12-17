@@ -5,19 +5,23 @@
 import tensorflow as tf
 from abc import ABCMeta
 import six
+from ..utils.develop import log_deprecated
 from ..tfutils.common import get_op_or_tensor_by_name
 
-__all__ = ['Callback', 'ProxyCallback', 'CallbackFactory', 'Triggerable']
+__all__ = ['Callback', 'ProxyCallback', 'CallbackFactory']
 
 
 @six.add_metaclass(ABCMeta)
 class Callback(object):
-    """ Base class for all callbacks.
+    """ Base class for all callbacks. See
+    `Write a Callback
+    <http://tensorpack.readthedocs.io/en/latest/tutorial/extend/callback.html>`_
+    for more detailed explanation of the callback methods.
 
     Attributes:
-        epoch_num(int): the number of the current epoch.
-        global_step(int): the number of global steps that have finished or is currently running.
-        local_step(int): the local steps within the current epoch.
+        epoch_num(int): trainer.epoch_num
+        global_step(int): trainer.global_step
+        local_step(int): trainer.local_step
         trainer(Trainer): the trainer.
         graph(tf.Graph): the graph.
 
@@ -41,10 +45,11 @@ class Callback(object):
     _chief_only = True
 
     def setup_graph(self, trainer):
-        self._steps_per_epoch = trainer.config.steps_per_epoch
         self.trainer = trainer
         self.graph = tf.get_default_graph()
-        with tf.name_scope(type(self).__name__):
+        scope_name = type(self).__name__
+        scope_name = scope_name.replace('_', '')
+        with tf.name_scope(scope_name):
             self._setup_graph()
 
     def _setup_graph(self):
@@ -200,9 +205,30 @@ class Callback(object):
     def __str__(self):
         return type(self).__name__
 
+    def get_tensors_maybe_in_tower(self, names):
+        """
+        Get tensors in the graph with the given names.
+        Will automatically check for the *first training tower*
+        if no existing tensor is found with the name.
 
-# back-compat. in case someone write something in triggerable
-Triggerable = Callback
+        Returns:
+            [tf.Tensor]
+        """
+        from ..train.tower import TowerTrainer  # noqa
+
+        def get_tensor(name):
+            msg = "Tensor {} not found in the graph!".format(name)
+            try:
+                return get_op_or_tensor_by_name(name)
+            except KeyError:
+                pass
+            assert isinstance(self.trainer, TowerTrainer), msg
+            towers = self.trainer.tower_func.towers
+            try:
+                return towers.training()[0][name]
+            except KeyError:
+                raise KeyError(msg)
+        return [get_tensor(name) for name in names]
 
 
 class ProxyCallback(Callback):
@@ -222,10 +248,14 @@ class ProxyCallback(Callback):
         self.cb.before_train()
 
     def _setup_graph(self):
-        self.cb.setup_graph(self.trainer)
+        with tf.name_scope(None):
+            self.cb.setup_graph(self.trainer)
 
     def _trigger_epoch(self):
         self.cb.trigger_epoch()
+
+    def _trigger(self):
+        self.cb.trigger()
 
     def _trigger_step(self):
         self.cb.trigger_step()
@@ -240,7 +270,7 @@ class ProxyCallback(Callback):
         self.cb.after_epoch()
 
     def _before_run(self, ctx):
-        self.cb._before_run(ctx)
+        return self.cb._before_run(ctx)
 
     def _after_run(self, ctx, run_values):
         self.cb._after_run(ctx, run_values)
@@ -253,16 +283,23 @@ class CallbackFactory(Callback):
     """
     Create a callback with some lambdas.
     """
-    def __init__(self, setup_graph=None, before_train=None,
-                 trigger_epoch=None, after_train=None):
+    def __init__(self, setup_graph=None, before_train=None, trigger=None,
+                 after_train=None, trigger_epoch=None):
         """
         Each lambda takes ``self`` as the only argument.
+
+        Note:
+            trigger_epoch was deprecated.
         """
 
         self._cb_setup_graph = setup_graph
         self._cb_before_train = before_train
-        self._cb_trigger_epoch = trigger_epoch
+        self._cb_trigger = trigger
         self._cb_after_train = after_train
+
+        if trigger_epoch:
+            self._cb_trigger = trigger_epoch
+            log_deprecated("CallbackFactory(trigger_epoch=)", "Use trigger instead.", "2017-11-15")
 
     def _setup_graph(self):
         if self._cb_setup_graph:
@@ -272,9 +309,9 @@ class CallbackFactory(Callback):
         if self._cb_before_train:
             self._cb_before_train(self)
 
-    def _trigger_epoch(self):
-        if self._cb_trigger_epoch:
-            self._cb_trigger_epoch(self)
+    def _trigger(self):
+        if self._cb_trigger:
+            self._cb_trigger(self)
 
     def _after_train(self):
         if self._cb_after_train:

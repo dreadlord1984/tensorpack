@@ -3,15 +3,13 @@
 # File: CycleGAN.py
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
-import os, sys
+import os
 import argparse
 import glob
-from six.moves import map, zip, range
-import numpy as np
+from six.moves import range
+
 
 from tensorpack import *
-from tensorpack.utils.viz import *
-import tensorpack.tfutils.symbolic_functions as symbf
 from tensorpack.tfutils.summary import add_moving_summary
 from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
 import tensorflow as tf
@@ -20,7 +18,10 @@ from GAN import GANTrainer, GANModelDesc
 """
 1. Download the dataset following the original project: https://github.com/junyanz/CycleGAN#train
 2. ./CycleGAN.py --data /path/to/datasets/horse2zebra
-Training and testing visuliazations will be in tensorboard.
+Training and testing visualizations will be in tensorboard.
+
+This implementation doesn't use fake sample buffer.
+It's not hard to add but I didn't observe any difference with it.
 """
 
 SHAPE = 256
@@ -86,15 +87,17 @@ class Model(GANModelDesc):
 
     def _build_graph(self, inputs):
         A, B = inputs
-        A = tf.transpose(A / 128.0 - 1.0, [0, 3, 1, 2])
-        B = tf.transpose(B / 128.0 - 1.0, [0, 3, 1, 2])
+        with tf.name_scope('preprocess'):
+            A = tf.transpose(A / 128.0 - 1.0, [0, 3, 1, 2])
+            B = tf.transpose(B / 128.0 - 1.0, [0, 3, 1, 2])
 
         def viz3(name, a, b, c):
-            im = tf.concat([a, b, c], axis=3)
-            im = tf.transpose(im, [0, 2, 3, 1])
-            im = (im + 1.0) * 128
-            im = tf.clip_by_value(im, 0, 255)
-            im = tf.cast(im, tf.uint8, name='viz_' + name)
+            with tf.name_scope(name):
+                im = tf.concat([a, b, c], axis=3)
+                im = tf.transpose(im, [0, 2, 3, 1])
+                im = (im + 1.0) * 128
+                im = tf.clip_by_value(im, 0, 255)
+                im = tf.cast(im, tf.uint8, name='viz')
             tf.summary.image(name, im, max_outputs=50)
 
         # use the initializers from torch
@@ -124,35 +127,35 @@ class Model(GANModelDesc):
                     B_dis_fake = self.discriminator(AB)
 
         def LSGAN_losses(real, fake):
-            with tf.name_scope('LSGAN_losses'):
-                d_real = tf.reduce_mean(tf.squared_difference(real, 0.9), name='d_real')
-                d_fake = tf.reduce_mean(tf.square(fake), name='d_fake')
-                d_loss = tf.multiply(d_real + d_fake, 0.5, name='d_loss')
+            d_real = tf.reduce_mean(tf.squared_difference(real, 1), name='d_real')
+            d_fake = tf.reduce_mean(tf.square(fake), name='d_fake')
+            d_loss = tf.multiply(d_real + d_fake, 0.5, name='d_loss')
 
-                g_loss = tf.reduce_mean(tf.squared_difference(fake, 0.9), name='g_loss')
-                add_moving_summary(g_loss, d_loss)
-                return g_loss, d_loss
+            g_loss = tf.reduce_mean(tf.squared_difference(fake, 1), name='g_loss')
+            add_moving_summary(g_loss, d_loss)
+            return g_loss, d_loss
 
-        with tf.name_scope('LossA'):
-            # reconstruction loss
-            recon_loss_A = tf.reduce_mean(tf.abs(A - ABA), name='recon_loss')
-            # gan loss
-            G_loss_A, D_loss_A = LSGAN_losses(A_dis_real, A_dis_fake)
+        with tf.name_scope('losses'):
+            with tf.name_scope('LossA'):
+                # reconstruction loss
+                recon_loss_A = tf.reduce_mean(tf.abs(A - ABA), name='recon_loss')
+                # gan loss
+                G_loss_A, D_loss_A = LSGAN_losses(A_dis_real, A_dis_fake)
 
-        with tf.name_scope('LossB'):
-            recon_loss_B = tf.reduce_mean(tf.abs(B - BAB), name='recon_loss')
-            G_loss_B, D_loss_B = LSGAN_losses(B_dis_real, B_dis_fake)
+            with tf.name_scope('LossB'):
+                recon_loss_B = tf.reduce_mean(tf.abs(B - BAB), name='recon_loss')
+                G_loss_B, D_loss_B = LSGAN_losses(B_dis_real, B_dis_fake)
 
-        LAMBDA = 10.0
-        self.g_loss = tf.add((G_loss_A + G_loss_B),
-                             (recon_loss_A + recon_loss_B) * LAMBDA, name='G_loss_total')
-        self.d_loss = tf.add(D_loss_A, D_loss_B, name='D_loss_total')
+            LAMBDA = 10.0
+            self.g_loss = tf.add((G_loss_A + G_loss_B),
+                                 (recon_loss_A + recon_loss_B) * LAMBDA, name='G_loss_total')
+            self.d_loss = tf.add(D_loss_A, D_loss_B, name='D_loss_total')
         self.collect_variables('gen', 'discrim')
 
         add_moving_summary(recon_loss_A, recon_loss_B, self.g_loss, self.d_loss)
 
     def _get_optimizer(self):
-        lr = symbolic_functions.get_scalar_var('learning_rate', 2e-4, summary=True)
+        lr = tf.get_variable('learning_rate', initializer=2e-4, trainable=False)
         return tf.train.AdamOptimizer(lr, beta1=0.5, epsilon=1e-3)
 
 
@@ -161,6 +164,7 @@ def get_data(datadir, isTrain=True):
         augs = [
             imgaug.Resize(int(SHAPE * 1.12)),
             imgaug.RandomCrop(SHAPE),
+            imgaug.Flip(horiz=True),
         ]
     else:
         augs = [imgaug.Resize(SHAPE)]
@@ -182,11 +186,12 @@ def get_data(datadir, isTrain=True):
 class VisualizeTestSet(Callback):
     def _setup_graph(self):
         self.pred = self.trainer.get_predictor(
-            ['inputA', 'inputB'], ['viz_A_recon', 'viz_B_recon'])
+            ['inputA', 'inputB'], ['A_recon/viz', 'B_recon/viz'])
 
     def _before_train(self):
         global args
         self.val_ds = get_data(args.data, isTrain=False)
+        self.val_ds.reset_state()
 
     def _trigger(self):
         idx = 0
@@ -210,9 +215,7 @@ if __name__ == '__main__':
     data = get_data(args.data)
     data = PrintData(data)
 
-    config = TrainConfig(
-        model=Model(),
-        dataflow=data,
+    GANTrainer(QueueInput(data), Model()).train_with_defaults(
         callbacks=[
             ModelSaver(),
             ScheduledHyperParamSetter(
@@ -221,7 +224,6 @@ if __name__ == '__main__':
             PeriodicTrigger(VisualizeTestSet(), every_k_epochs=3),
         ],
         max_epoch=195,
+        steps_per_epoch=data.size(),
         session_init=SaverRestore(args.load) if args.load else None
     )
-
-    GANTrainer(config).train()

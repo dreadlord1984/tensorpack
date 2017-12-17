@@ -4,7 +4,7 @@
 
 import tensorflow as tf
 
-__all__ = ['StaticDynamicAxis', 'StaticDynamicShape']
+__all__ = []
 
 
 class StaticDynamicAxis(object):
@@ -16,7 +16,7 @@ class StaticDynamicAxis(object):
         try:
             st = f(self.static)
             return StaticDynamicAxis(st, st)
-        except:
+        except TypeError:
             return StaticDynamicAxis(None, f(self.dynamic))
 
     def __str__(self):
@@ -53,7 +53,7 @@ class StaticDynamicShape(object):
                 self.static[axis] = st
                 self.dynamic[axis] = StaticLazyAxis(st)
                 return
-            except:
+            except TypeError:
                 pass
         self.static[axis] = None
         dyn = self.dynamic[axis]

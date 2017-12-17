@@ -7,12 +7,13 @@ import six
 from six.moves import range
 import os
 
-from ..utils import logger, get_tqdm
+from ..utils import logger
+from ..utils.utils import get_tqdm
 from ..utils.timer import timed_operation
 from ..utils.loadcaffe import get_caffe_pb
 from ..utils.serialize import loads
 from ..utils.argtools import log_once
-from .base import RNGDataFlow, DataFlow
+from .base import RNGDataFlow, DataFlow, DataFlowReentrantGuard
 from .common import MapData
 
 __all__ = ['HDF5Data', 'LMDBData', 'LMDBDataDecoder', 'LMDBDataPoint',
@@ -28,9 +29,9 @@ class HDF5Data(RNGDataFlow):
     Zip data from different paths in an HDF5 file.
 
     Warning:
-        The current implementation will load all data into memory.
+        The current implementation will load all data into memory. (TODO)
     """
-    # TODO lazy load
+# TODO
 
     def __init__(self, filename, data_paths, shuffle=True):
         """
@@ -60,7 +61,8 @@ class HDF5Data(RNGDataFlow):
 
 
 class LMDBData(RNGDataFlow):
-    """ Read a LMDB database and produce (k,v) pairs """
+    """ Read a LMDB database and produce (k,v) raw string pairs.
+    """
     def __init__(self, lmdb_path, shuffle=True, keys=None):
         """
         Args:
@@ -78,10 +80,11 @@ class LMDBData(RNGDataFlow):
         self._lmdb_path = lmdb_path
         self._shuffle = shuffle
 
-        self.open_lmdb()
+        self._open_lmdb()
         self._size = self._txn.stat()['entries']
         self._set_keys(keys)
         logger.info("Found {} entries in {}".format(self._size, self._lmdb_path))
+        self._guard = DataFlowReentrantGuard()
 
     def _set_keys(self, keys=None):
         def find_keys(txn, size):
@@ -111,7 +114,7 @@ class LMDBData(RNGDataFlow):
                 else:
                     self.keys = keys
 
-    def open_lmdb(self):
+    def _open_lmdb(self):
         self._lmdb = lmdb.open(self._lmdb_path,
                                subdir=os.path.isdir(self._lmdb_path),
                                readonly=True, lock=False, readahead=True,
@@ -121,23 +124,24 @@ class LMDBData(RNGDataFlow):
     def reset_state(self):
         self._lmdb.close()
         super(LMDBData, self).reset_state()
-        self.open_lmdb()
+        self._open_lmdb()
 
     def size(self):
         return self._size
 
     def get_data(self):
-        if not self._shuffle:
-            c = self._txn.cursor()
-            while c.next():
-                k, v = c.item()
-                if k != b'__keys__':
+        with self._guard:
+            if not self._shuffle:
+                c = self._txn.cursor()
+                while c.next():
+                    k, v = c.item()
+                    if k != b'__keys__':
+                        yield [k, v]
+            else:
+                self.rng.shuffle(self.keys)
+                for k in self.keys:
+                    v = self._txn.get(k)
                     yield [k, v]
-        else:
-            self.rng.shuffle(self.keys)
-            for k in self.keys:
-                v = self._txn.get(k)
-                yield [k, v]
 
 
 class LMDBDataDecoder(MapData):
@@ -157,8 +161,9 @@ class LMDBDataDecoder(MapData):
 class LMDBDataPoint(MapData):
     """
     Read a LMDB file and produce deserialized datapoints.
-    It reads the database produced by
-    :func:`tensorpack.dataflow.dftools.dump_dataflow_to_lmdb`.
+    It only accepts the database produced by
+    :func:`tensorpack.dataflow.dftools.dump_dataflow_to_lmdb`,
+    which uses :func:`tensorpack.utils.serialize.dumps` for serialization.
 
     Example:
         .. code-block:: python
@@ -234,6 +239,7 @@ class SVMLightData(RNGDataFlow):
             filename (str): input file
             shuffle (bool): shuffle the data
         """
+        import sklearn.datasets  # noqa
         self.X, self.y = sklearn.datasets.load_svmlight_file(filename)
         self.X = np.asarray(self.X.todense())
         self.shuffle = shuffle
@@ -262,7 +268,7 @@ class TFRecordData(DataFlow):
             size (int): total number of records, because this metadata is not
                 stored in the tfrecord file.
         """
-        self._gen = tf.python_io.tf_record_iterator(path)
+        self._path = path
         self._size = int(size)
 
     def size(self):
@@ -271,7 +277,8 @@ class TFRecordData(DataFlow):
         return super(TFRecordData, self).size()
 
     def get_data(self):
-        for dp in self._gen:
+        gen = tf.python_io.tf_record_iterator(self._path)
+        for dp in gen:
             yield loads(dp)
 
 from ..utils.develop import create_dummy_class   # noqa
@@ -285,11 +292,6 @@ try:
 except ImportError:
     for klass in ['LMDBData', 'LMDBDataDecoder', 'LMDBDataPoint', 'CaffeLMDB']:
         globals()[klass] = create_dummy_class(klass, 'lmdb')
-
-try:
-    import sklearn.datasets
-except ImportError:
-    SVMLightData = create_dummy_class('SVMLightData', 'sklearn')   # noqa
 
 try:
     import tensorflow as tf

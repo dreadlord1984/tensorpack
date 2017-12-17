@@ -10,10 +10,12 @@ from scipy.signal import convolve2d
 from six.moves import range, zip
 import multiprocessing
 
+
 from tensorpack import *
 from tensorpack.utils import logger
 from tensorpack.utils.viz import *
 from tensorpack.utils.argtools import shape2d, shape4d
+from tensorpack.dataflow import dataset
 
 BATCH = 32
 SHAPE = 64
@@ -76,7 +78,7 @@ class OnlineTensorboardExport(Callback):
             x /= x.max()
             return x
 
-        o = self.pred([self.theta])
+        o = self.pred(self.theta)
 
         gt_filters = np.concatenate([self.filters[i, :, :] for i in range(8)], axis=0)
         pred_filters = np.concatenate([o[0][i, :, :, 0] for i in range(8)], axis=0)
@@ -94,7 +96,6 @@ class OnlineTensorboardExport(Callback):
 
 class Model(ModelDesc):
     def _get_inputs(self):
-        # TODO: allow arbitrary batch sizes
         return [InputDesc(tf.float32, (BATCH, ), 'theta'),
                 InputDesc(tf.float32, (BATCH, SHAPE, SHAPE), 'image'),
                 InputDesc(tf.float32, (BATCH, SHAPE, SHAPE), 'gt_image'),
@@ -120,9 +121,9 @@ class Model(ModelDesc):
         logger.info('Parameter net output: {}'.format(pred_filter.get_shape().as_list()))
         return pred_filter
 
-    def _build_graph(self, input_vars):
+    def _build_graph(self, inputs):
         kernel_size = 9
-        theta, image, gt_image, gt_filter = input_vars
+        theta, image, gt_image, gt_filter = inputs
 
         image = image
         gt_image = gt_image
@@ -147,8 +148,7 @@ class Model(ModelDesc):
         summary.add_moving_summary(self.cost)
 
     def _get_optimizer(self):
-        lr = symbolic_functions.get_scalar_var('learning_rate', 1e-3, summary=True)
-        return tf.train.AdamOptimizer(lr)
+        return tf.train.AdamOptimizer(1e-3)
 
 
 class ThetaImages(ProxyDataFlow, RNGDataFlow):
@@ -262,5 +262,4 @@ if __name__ == '__main__':
         config = get_config()
         if args.load:
             config.session_init = SaverRestore(args.load)
-        config.nr_tower = NR_GPU
-        SyncMultiGPUTrainer(config).train()
+        launch_train_with_config(config, SyncMultiGPUTrainer(NR_GPU))
